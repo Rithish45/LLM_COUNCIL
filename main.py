@@ -1,6 +1,5 @@
-def main():
-    print("Hello from llm-council!")
+"""Root entrypoint exporting FastAPI app for Vercel / serverless deployments."""
 
+from backend.main import app
 
-if __name__ == "__main__":
-    main()
+__all__ = ["app"]
