@@ -16,7 +16,7 @@ logger = logging.getLogger("llm_council.api")
 
 app = FastAPI(title="6-Agent LLM Council API")
 
-# Enable CORS for frontend development
+# Enable CORS for frontend development and Vercel deployments
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,16 +41,16 @@ _WEBSOCKET_CONNECTIONS: Dict[str, List[WebSocket]] = {}
 
 @app.on_event("startup")
 async def startup_event():
-    """Fail fast at startup if local Ollama server is unreachable and warm up all 4 local models in VRAM."""
-    is_reachable = await check_ollama_reachable()
-    if not is_reachable:
-        logger.warning(
-            "OLLAMA WARNING: Local Ollama server is currently unreachable at configured OLLAMA_BASE_URL."
-        )
-    else:
-        logger.info("Ollama server reached successfully. Warming up all 4 local models into VRAM...")
-        warmup_res = await warmup_local_models()
-        logger.info(f"Warmup results (ms per agent role): {warmup_res}")
+    """Safely check Ollama reachability on startup without throwing exceptions on serverless environments."""
+    try:
+        is_reachable = await asyncio.wait_for(check_ollama_reachable(), timeout=2.0)
+        if is_reachable:
+            logger.info("Ollama server reached successfully. Warming up local models...")
+            await warmup_local_models()
+        else:
+            logger.info("Local Ollama server not reached. Cloud fallbacks (Groq/Gemini) will be used.")
+    except Exception as e:
+        logger.info(f"Serverless/Cloud environment detected or Ollama check skipped: {e}")
 
 
 @app.get("/")
@@ -61,92 +61,76 @@ async def root():
 
 @app.get("/api/health")
 async def health_check():
-    """Diagnostic health check."""
-    ollama_ok = await check_ollama_reachable()
-    return {
-        "status": "ok" if ollama_ok else "degraded",
-        "ollama_reachable": ollama_ok
-    }
+    """Explicit API health check endpoint."""
+    return {"status": "ok", "service": "6-Agent LLM Council API"}
 
 
-@app.post("/api/council/run", response_model=StartCouncilResponse)
-async def start_council_run(request: StartCouncilRequest, background_tasks: BackgroundTasks):
+@app.post("/api/council/run")
+async def run_council_api(body: StartCouncilRequest, background_tasks: BackgroundTasks):
     """
-    Start a new multi-round council run in the background.
-    Returns request_id immediately for WebSocket streaming and result polling.
+    POST /api/council/run
+    Starts a council debate run in background and returns request_id immediately.
     """
-    if not request.question or not request.question.strip():
+    question = body.question.strip()
+    if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
     request_id = str(uuid.uuid4())
 
-    # Dispatch council run in background task
-    background_tasks.add_task(run_and_notify_websockets, request.question, request_id)
+    async def _run():
+        try:
+            await execute_council_run(user_query=question, request_id=request_id)
+        except Exception as e:
+            logger.error(f"Error in background council run {request_id}: {e}")
 
-    return StartCouncilResponse(
-        request_id=request_id,
-        message="Council run initiated successfully."
-    )
+    background_tasks.add_task(_run)
 
-
-async def run_and_notify_websockets(question: str, request_id: str):
-    """Execute council run and stream events via WebSockets."""
-    # Callback to stream events directly to connected WebSockets
-    def ws_broadcast(entry: Dict[str, Any]):
-        if entry.get("request_id") == request_id and request_id in _WEBSOCKET_CONNECTIONS:
-            connections = list(_WEBSOCKET_CONNECTIONS[request_id])
-            for ws in connections:
-                try:
-                    asyncio.create_task(ws.send_text(json.dumps(entry)))
-                except Exception as e:
-                    logger.warning(f"Error sending WebSocket message: {e}")
-
-    register_status_callback(ws_broadcast)
-    try:
-        await execute_council_run(question, request_id=request_id)
-        # Send completion event
-        if request_id in _WEBSOCKET_CONNECTIONS:
-            final_state = get_council_state(request_id)
-            for ws in list(_WEBSOCKET_CONNECTIONS[request_id]):
-                try:
-                    await ws.send_text(json.dumps({
-                        "request_id": request_id,
-                        "status": "completed",
-                        "final_state": final_state
-                    }))
-                except Exception:
-                    pass
-    finally:
-        unregister_status_callback(ws_broadcast)
+    return {
+        "request_id": request_id,
+        "message": f"Council run initiated for query: '{question}'"
+    }
 
 
-@app.get("/api/council/result/{request_id}")
-async def get_council_result(request_id: str):
-    """Get complete state object for a given request_id."""
+@app.get("/api/council/state/{request_id}")
+async def get_council_state_api(request_id: str):
+    """GET /api/council/state/{request_id} - Fetches current state of a council run."""
     state = get_council_state(request_id)
     if not state:
-        raise HTTPException(status_code=404, detail="Council run request_id not found.")
+        raise HTTPException(status_code=404, detail="Request ID not found.")
     return state
 
 
 @app.websocket("/ws/council/{request_id}")
-async def websocket_endpoint(websocket: WebSocket, request_id: str):
-    """WebSocket stream of live agent execution logs and text streaming."""
+async def websocket_council_endpoint(websocket: WebSocket, request_id: str):
+    """WebSocket endpoint for real-time live streaming of council deliberation status updates."""
     await websocket.accept()
+
     if request_id not in _WEBSOCKET_CONNECTIONS:
         _WEBSOCKET_CONNECTIONS[request_id] = []
     _WEBSOCKET_CONNECTIONS[request_id].append(websocket)
 
-    # Send current accumulated logs on initial connection
-    existing_state = get_council_state(request_id)
-    if existing_state and existing_state.get("agent_status_log"):
-        for entry in existing_state["agent_status_log"]:
-            await websocket.send_text(json.dumps(entry))
+    def _broadcast_to_ws(entry: Dict[str, Any]):
+        if entry.get("request_id") == request_id or not entry.get("request_id"):
+            dead_ws = []
+            for ws in _WEBSOCKET_CONNECTIONS.get(request_id, []):
+                try:
+                    asyncio.create_task(ws.send_text(json.dumps(entry)))
+                except Exception:
+                    dead_ws.append(ws)
+            for ws in dead_ws:
+                if ws in _WEBSOCKET_CONNECTIONS.get(request_id, []):
+                    _WEBSOCKET_CONNECTIONS[request_id].remove(ws)
+
+    register_status_callback(_broadcast_to_ws)
 
     try:
         while True:
-            # Keep connection alive
             await websocket.receive_text()
     except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.warning(f"WebSocket error for {request_id}: {e}")
+    finally:
+        unregister_status_callback(_broadcast_to_ws)
         if request_id in _WEBSOCKET_CONNECTIONS and websocket in _WEBSOCKET_CONNECTIONS[request_id]:
             _WEBSOCKET_CONNECTIONS[request_id].remove(websocket)

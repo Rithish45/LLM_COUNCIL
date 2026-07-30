@@ -15,10 +15,25 @@ import RoundNavigator from './components/RoundNavigator';
 
 import { Sparkles, ShieldCheck, Cpu, Globe } from 'lucide-react';
 
-const API_BASE = 'http://localhost:8001';
-const WS_BASE = 'ws://localhost:8001';
+const getApiBase = () => {
+  if (typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+    return window.location.origin;
+  }
+  return 'http://localhost:8001';
+};
+
+const getWsBase = () => {
+  if (typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${protocol}//${window.location.host}`;
+  }
+  return 'ws://localhost:8001';
+};
 
 export default function App() {
+  const API_BASE = getApiBase();
+  const WS_BASE = getWsBase();
+
   const socketRef = useRef(null);
   const reconnectTimer = useRef(null);
   const startRun = useCouncilStore((state) => state.startRun);
